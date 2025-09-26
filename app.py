@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import psycopg2
 import psycopg2.extras
@@ -6,14 +6,15 @@ import requests
 import bcrypt
 from sentence_transformers import SentenceTransformer
 import io
+from flask import send_file
 from pdf2image import convert_from_bytes
 import pytesseract
 from docx import Document
 from io import BytesIO
-import fitz  # PyMuPDF
+import fitz  # pip install PyMuPDF
 from dotenv import load_dotenv
 import os
-from PIL import Image  # Added missing import
+from PIL import Image
 
 app = Flask(__name__)
 CORS(app)
@@ -66,6 +67,27 @@ def register():
         cur.close()
         conn.close()
 
+
+# ==== DOWNLOAD / VIEW DOCUMENT ====
+@app.route("/document/<int:doc_id>", methods=["GET"])
+def get_document(doc_id):
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute("SELECT filename, file_data FROM documents WHERE id=%s", (doc_id,))
+    doc = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not doc:
+        return jsonify({"error": "Document not found"}), 404
+
+    # Serve file to browser
+    return send_file(
+        io.BytesIO(doc["file_data"]),
+        download_name=doc["filename"],
+        as_attachment=False  # Set False if you want browser to try opening it
+    )        
+
 @app.route("/login", methods=["POST"])
 def login():
     data = request.json
@@ -86,25 +108,6 @@ def login():
         return jsonify({"msg": "Login successful", "user_id": user["id"], "role": user["role"]})
     else:
         return jsonify({"error": "Invalid credentials"}), 401
-
-# ==== DOWNLOAD / VIEW DOCUMENT ====
-@app.route("/document/<int:doc_id>", methods=["GET"])
-def get_document(doc_id):
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("SELECT filename, file_data FROM documents WHERE id=%s", (doc_id,))
-    doc = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    if not doc:
-        return jsonify({"error": "Document not found"}), 404
-
-    return send_file(
-        io.BytesIO(doc["file_data"]),
-        download_name=doc["filename"],
-        as_attachment=False
-    )
 
 # ==== Hugging Face Helpers ====
 def hf_classify_document(text):
@@ -131,7 +134,7 @@ def hf_summarize(text):
 def local_embed(text: str):
     if not text.strip():
         return [0.0] * 384
-    return embed_model.encode([text])[0].tolist()
+    return embed_model.encode([text])[0].tolist()  # 384-dim vector
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -142,10 +145,12 @@ def upload():
 
     extracted_text = request.form.get("extracted_text", "").strip()
 
+    # ---- Cloud-ready text extraction ----
     if not extracted_text:
         ext = filename.lower().split(".")[-1]
 
         if ext == "pdf":
+            # PyMuPDF: extract text from PDF pages
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             full_text = ""
             for page in doc:
@@ -153,6 +158,7 @@ def upload():
                 if text.strip():
                     full_text += text + "\n"
                 else:
+                    # If page is image-based, do OCR
                     pix = page.get_pixmap()
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     full_text += pytesseract.image_to_string(img) + "\n"
@@ -172,10 +178,12 @@ def upload():
     if not extracted_text:
         return jsonify({"error": "No text could be extracted"}), 400
 
+    # ---- Hugging Face processing ----
     classification = hf_classify_document(extracted_text)
     summary = hf_summarize(extracted_text)
     embedding = local_embed(extracted_text)
 
+    # ---- Save to DB ----
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -187,7 +195,6 @@ def upload():
     conn.close()
 
     return jsonify({"msg": "File uploaded & processed", "extracted_text": extracted_text}), 201
-
 # ==== SEARCH ====
 @app.route("/search", methods=["POST"])
 def search():
@@ -196,7 +203,7 @@ def search():
     role = data["role"]
     query = data["query"]
 
-    query_emb = local_embed(query)
+    query_emb = local_embed(query)  # Local embedding
 
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
@@ -223,5 +230,7 @@ def search():
     return jsonify([dict(r) for r in results])
 
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
